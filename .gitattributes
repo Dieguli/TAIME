@@ -1,0 +1,5 @@
+# Deployment files must keep LF regardless of host core.autocrlf, or they break
+# inside Linux containers (CRLF in a shell script / Dockerfile RUN line fails).
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+Dockerfile.* text eol=lf

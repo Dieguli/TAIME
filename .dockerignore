@@ -1,0 +1,31 @@
+# Keep the build context small and reproducible.
+.git
+.gitignore
+.venv
+venv
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Local data / artifacts (provided via volumes at runtime).
+data
+datasets
+output
+outputs
+models_datasets
+docker/wheels
+
+# Built SPA is produced fresh in the web-build stage.
+apps/api/static
+apps/api/taime.db
+
+# Dev/editor/agent noise and large binaries.
+.agents
+.qa2
+.qa_tmp
+*.pptx
+.DS_Store

@@ -1,0 +1,23 @@
+TAIME v2.0 — Trustworthy AI Models Engine
+Copyright 2026 THEMIS 5.0 Consortium
+
+This product is licensed under the Apache License, Version 2.0 (see the LICENSE
+file). It was developed within the THEMIS 5.0 project.
+
+Funding attribution
+--------------------
+THEMIS 5.0 has received funding from the European Union's Horizon Europe
+research and innovation programme under grant agreement No 101135049.
+
+Views and opinions expressed are however those of the author(s) only and do not
+necessarily reflect those of the European Union. Neither the European Union nor
+the granting authority can be held responsible for them.
+
+Third-party components
+----------------------
+This software depends on third-party open-source packages (including FastAPI,
+Uvicorn, SQLModel, React, Vite, PyTorch, XGBoost, Hugging Face Transformers,
+and Darts), each distributed under its own license.
+
+The trained SUT models and datasets used with this platform are proprietary and
+are NOT included in this repository. Users supply their own models and data.

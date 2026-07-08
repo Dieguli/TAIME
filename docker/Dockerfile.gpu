@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1
+# TAIME v2.0 — GPU (CUDA) image.
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+# Requires an NVIDIA driver + the NVIDIA Container Toolkit on the host.
+
+# --- Stage 1: build the React frontend -------------------------------------
+FROM node:20-slim AS web-build
+WORKDIR /app/apps/web
+COPY apps/web/package.json apps/web/package-lock.json ./
+RUN npm ci
+COPY apps/web/ ./
+RUN npm run build
+
+# --- Stage 2: CUDA runtime -------------------------------------------------
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS runtime
+
+# CUDA 12.4 torch wheels. Adjust TORCH_INDEX_URL to match the host CUDA/driver.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+# Bake the DistilBERT-cased fake-news base model at build time (needs network
+# during build). This keeps runtime fully offline so the default GPU compose can
+# retrain fake news with zero extra setup. Set to "false" to skip it.
+ARG FETCH_MODELS=true
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    HF_HUB_DISABLE_XET=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    DATA_DIR=/data \
+    HOST=0.0.0.0 \
+    PORT=8000
+
+# Fake-news base model lives outside the /data volume so the runtime bind mount
+# cannot shadow the copy baked into the image at build time.
+ENV FAKE_NEWS_MODEL_DIR=/opt/taime-models/hf/distilbert-base-cased
+
+# Ubuntu 22.04 ships Python 3.10 (>=3.10 satisfies the project). A venv avoids
+# PEP-668 "externally-managed-environment" restrictions. libgomp1 is needed by
+# torch / xgboost at runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv
+
+WORKDIR /app
+
+# CUDA torch wheel first so the editable install reuses it.
+RUN pip install --upgrade pip \
+    && pip install "torch>=2.4,<2.8" --index-url ${TORCH_INDEX_URL}
+
+# Backend source + editable install (keeps src layout so static resolves).
+COPY apps/api/ /app/apps/api/
+COPY scripts/ /app/scripts/
+# pyproject.toml references ../../README.md for its long description.
+COPY README.md /app/README.md
+RUN pip install -e /app/apps/api
+
+COPY --from=web-build /app/apps/api/static /app/apps/api/static
+
+# Bake the fake-news base model outside the /data volume (see CPU Dockerfile).
+# See CPU Dockerfile: remove hf_xet so huggingface_hub falls back to plain HTTP.
+RUN if [ "$FETCH_MODELS" = "true" ]; then \
+        pip uninstall -y hf_xet >/dev/null 2>&1 || true; \
+        DATA_DIR=/opt/taime-models python /app/scripts/fetch_models.py; \
+    fi
+
+RUN mkdir -p /data/datasets /data/models /data/logs
+VOLUME ["/data"]
+EXPOSE 8000
+
+CMD ["uvicorn", "taime_api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,37 @@
+# TAIME v2.0 — primary (CPU) deployment.
+#   docker compose up --build
+# For GPU, add the override:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+services:
+  taime:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: taime:cpu
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      TAIME_IMAGE: cpu
+      MAX_WORKERS: ${MAX_WORKERS:-1}
+      # Set TAIME_ALLOW_HF_DOWNLOAD=1 to fetch the DistilBERT-cased base at runtime
+      # if it was not baked into the image or mounted under /data/hf.
+      TAIME_ALLOW_HF_DOWNLOAD: ${TAIME_ALLOW_HF_DOWNLOAD:-}
+      # Hate-speech model bundle (defaults to models_datasets/FakeNews_HateSpeech_model.zip).
+      HATE_SPEECH_MODEL_ZIP: ${HATE_SPEECH_MODEL_ZIP:-}
+    volumes:
+      # Persist SQLite DB, uploaded datasets, model artifacts, and HF assets.
+      - ./data:/data
+      # Provide the hate-speech model bundle here (read by the trainer).
+      - ./models_datasets:/app/models_datasets
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
