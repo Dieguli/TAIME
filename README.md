@@ -132,18 +132,77 @@ job:
 
 ---
 
-## Using the app
+## Train a model — step by step
 
-1. **Datasets** — drag & drop a `.zip` for the SUT you want to retrain. The file is
-   validated against that SUT's contract, extracted, and you get a preview (columns,
-   basic statistics, sample rows).
-2. **Retraining (Jobs)** — pick the dataset, choose a preset or set hyperparameters
-   (epochs, learning rate, batch size, plus model-specific options), select the
-   compute device (CPU / GPU when available), and launch. The job runs in a
-   background worker.
-3. **Monitor** — the job list polls for live status/progress; open a job to see its
-   metrics and report.
-4. **Models** — browse trained artifacts per SUT and **download** the `.zip`.
+The flow is the same in the web UI or via the REST API:
+**upload a dataset package → launch a retraining job → wait for it to finish →
+download the artifact.** Datasets are always *uploaded* (never hand-placed under
+`./data`); the only files you put on disk yourself are base-model bundles
+(see [Bring your own models & data](#bring-your-own-models--data)).
+
+> **First run:** `docker compose up --build` downloads the ML wheels and bakes the
+> DistilBERT base — expect **~10–15 min** the first time (then it's cached). The app
+> starts with an empty catalog; you populate it by uploading.
+
+### A. In the web UI (`http://localhost:8000`)
+
+1. **Control Center** — landing page; shows per-SUT readiness (dataset / job / model)
+   and recent activity.
+2. **Datasets** → drag & drop your SUT's `.zip`. It is validated against that SUT's
+   required files, extracted, and previewed (columns, statistics, sample rows).
+3. **Retraining** → select the dataset, pick a **fast-demo preset** or set
+   hyperparameters (reference below), choose **CPU / GPU**, and **Launch**.
+4. The job runs in the background and the page auto-refreshes status/progress; open a
+   job to see its metrics and report.
+5. **Models** → **download** the trained artifact `.zip` (traceable to its dataset + job).
+
+### B. Via the REST API (same flow, copy-paste)
+
+```bash
+# 1) Upload a dataset package (multipart form).           -> {"id": 1, ...}
+curl -s -F "file=@healthcare_pc.zip" -F "name=my-run" -F "sut_type=healthcare_pc" \
+  http://localhost:8000/api/v1/datasets
+
+# 2) Launch a retraining job (JSON body).                 -> {"id": 1, "status": "pending", ...}
+curl -s -X POST http://localhost:8000/api/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"dataset_id": 1, "sut_type": "healthcare_pc", "config": {"n_estimators": 200, "device": "cpu"}}'
+
+# 3) Poll until status == "completed" (progress 0 -> 100; "metrics" fills in).
+curl -s http://localhost:8000/api/v1/jobs/1
+
+# 4) Find the model for your job (its "job_id"), then download the artifact .zip.
+curl -s http://localhost:8000/api/v1/models
+curl -s http://localhost:8000/api/v1/models/1/download -o healthcare_model.zip
+```
+
+Send an empty `config` to accept the trainer defaults. Invalid values return
+**HTTP 422** naming the offending field.
+
+### Retraining parameters (the `config` object)
+
+Only keys you send are applied; the rest fall back to the defaults shown.
+
+| SUT | Framework | Key `config` fields *(default)* | Allowed / notes |
+|-----|-----------|--------------------------------|-----------------|
+| `healthcare_pc` | XGBoost | `n_estimators` *(120)*, `max_depth` *(6)*, `learning_rate` *(0.1)*, `test_split` *(0.2)*, `random_state` *(42)* | trains from scratch; runs in seconds |
+| `disinfo_fake` | DistilBERT | `epochs` *(3)*, `batch_size` *(16)*, `learning_rate` *(5e-6)*, `weight_decay` *(0.1)*, `warmup_steps` *(0)*, `seed` *(42)*, `max_train_samples`, `max_length` *(128)* | `max_train_samples` caps rows for a fast demo |
+| `disinfo_hate` | RoBERTa | `epochs` *(5)*, `batch_size` *(16)*, `learning_rate` *(5e-5)*, `weight_decay` *(0.01)*, `warmup_steps` *(500)*, `seed`, `max_train_samples`, `max_length`, `classification_type` *(binary)* | `classification_type` ∈ {`binary`, `multilabel`} |
+| `infra_port` | Darts TSMixer | `epochs`/`n_epochs`, `batch_size` *(64)*, `dropout` *(0.2)*, `learning_rate` *(1e-3)*, `lr_scheduler_factor` *(0.5)*, `lr_scheduler_patience` *(5)*, `norm_type` *(LayerNorm)* | `batch_size` ∈ {64,128,256}; `dropout` ∈ [0.2,0.5]; `learning_rate` ∈ [1e-5,1e-3]; `norm_type` ∈ {LayerNorm, LayerNormNoBias, TimeBatchNorm2d}; model architecture is recovered from the seed `.pt`, not tuned |
+
+Every SUT also accepts `device` (`auto` \| `cpu` \| `cuda`).
+
+### What a completed job produces
+
+The job's **`metrics`** (accuracy / precision / recall / F1, confusion matrix,
+per-class report, sample counts) are shown in the UI and in `GET /api/v1/jobs/{id}`.
+The downloadable artifact `.zip` contains:
+
+| SUT | Artifact contents |
+|-----|-------------------|
+| `healthcare_pc` | `healthcare_pc_model_<job>.pkl` (XGBoost model) |
+| `disinfo_fake` / `disinfo_hate` | model dir: `config.json`, `model.safetensors`, tokenizer files |
+| `infra_port` | `port_model_<job>.pt` + `port_model_<job>.pt.ckpt` (Darts TSMixer) |
 
 ---
 
