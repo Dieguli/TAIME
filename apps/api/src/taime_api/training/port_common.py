@@ -28,13 +28,15 @@ LR_FACTOR_RANGE: tuple[float, float] = (0.1, 0.9)
 LR_PATIENCE_RANGE: tuple[int, int] = (1, 10)
 
 # Structural defaults (used only when they cannot be recovered from the seed model).
+# They mirror the partner's production seed (TSMixer_Study_V7_NumEscala) so a failed
+# seed read still trains the same architecture instead of an unrelated one.
 PORT_STRUCTURAL_DEFAULTS: dict[str, Any] = {
-    "input_chunk_length": 96,
+    "input_chunk_length": 48,
     "output_chunk_length": 48,
-    "hidden_size": 64,
-    "ff_size": 64,
-    "num_blocks": 2,
-    "activation": "ReLU",
+    "hidden_size": 32,
+    "ff_size": 256,
+    "num_blocks": 1,
+    "activation": "Sigmoid",
 }
 _STRUCTURAL_INT_KEYS = (
     "input_chunk_length",
@@ -81,7 +83,10 @@ def resolve_port_hparams(config: dict[str, Any] | None) -> dict[str, Any]:
         "learning_rate": _to_float(config.get("learning_rate"), 1e-3),
         "lr_scheduler_factor": _to_float(config.get("lr_scheduler_factor"), 0.5),
         "lr_scheduler_patience": _to_int(config.get("lr_scheduler_patience"), 5),
-        "use_reversible_instance_norm": _to_bool(config.get("use_reversible_instance_norm"), True),
+        # Off by default: on a binary target RIN de-normalizes a flat (all-0/all-1)
+        # input window to a logit ~= the window mean, so sigmoid >= 0.5 predicts 1
+        # everywhere unless trained with a far larger lr than the approved range.
+        "use_reversible_instance_norm": _to_bool(config.get("use_reversible_instance_norm"), False),
         "normalize_before": _to_bool(config.get("normalize_before"), False),
         "norm_type": str(config.get("norm_type") or "LayerNorm"),
     }

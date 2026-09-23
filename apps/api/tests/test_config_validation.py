@@ -20,6 +20,7 @@ from taime_api.training.config_validation import ConfigValidationError, validate
             "normalize_before": False,
         },
         {"batch_size": 64, "norm_type": "LayerNorm", "device": "cuda"},
+        {"max_series": 500, "backtest_max_series": 0},  # <= 0 means "all series"
     ],
 )
 def test_port_valid(config):
@@ -36,6 +37,8 @@ def test_port_valid(config):
         {"lr_scheduler_factor": 1.5},  # outside [0.1, 0.9]
         {"lr_scheduler_patience": 99},  # outside [1, 10]
         {"norm_type": "Nope"},  # not an allowed norm
+        {"max_series": "all"},  # series caps must be integers
+        {"backtest_max_series": 2.5},
     ],
 )
 def test_port_invalid(config):

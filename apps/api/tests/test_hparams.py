@@ -71,7 +71,7 @@ def test_port_hparams_defaults():
     assert h["batch_size"] == 64
     assert h["n_epochs"] == 10
     assert h["norm_type"] == "LayerNorm"
-    assert h["use_reversible_instance_norm"] is True
+    assert h["use_reversible_instance_norm"] is False
     assert h["normalize_before"] is False
 
 
@@ -84,7 +84,7 @@ def test_port_hparams_overrides():
             "learning_rate": 1e-5,
             "lr_scheduler_factor": 0.1,
             "lr_scheduler_patience": 10,
-            "use_reversible_instance_norm": False,
+            "use_reversible_instance_norm": True,
             "normalize_before": True,
             "norm_type": "TimeBatchNorm2d",
         }
@@ -97,7 +97,7 @@ def test_port_hparams_overrides():
     assert h["lr_scheduler_patience"] == 10
     assert h["norm_type"] == "TimeBatchNorm2d"
     assert h["normalize_before"] is True
-    assert h["use_reversible_instance_norm"] is False
+    assert h["use_reversible_instance_norm"] is True
 
 
 def test_structural_overrides():

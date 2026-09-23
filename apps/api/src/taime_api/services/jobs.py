@@ -76,12 +76,12 @@ def _normalize_port_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized["forecast_horizon"] = max(1, _to_int(config.get("forecast_horizon"), 48))
     normalized["stride"] = max(1, _to_int(config.get("stride"), 1))
     normalized["last_points_only"] = _to_bool(config.get("last_points_only"), False)
-    max_series = config.get("max_series")
-    if max_series is None:
-        normalized["max_series"] = 20
-    else:
-        max_series_value = _to_int(max_series, 20)
-        normalized["max_series"] = None if max_series_value <= 0 else max_series_value
+    # Retrain on every series unless a positive cap is given (<= 0 also means "all").
+    max_series_value = _to_int(config.get("max_series"), 0)
+    normalized["max_series"] = None if max_series_value <= 0 else max_series_value
+    # The post-training backtest runs on a few held-out series (<= 0 means "all").
+    backtest_max_series = _to_int(config.get("backtest_max_series"), 20)
+    normalized["backtest_max_series"] = None if backtest_max_series <= 0 else backtest_max_series
     normalized["backtest"] = _to_bool(config.get("backtest"), True)
     normalized["accelerator"] = config.get("accelerator") or _device_to_accelerator(
         config.get("device")

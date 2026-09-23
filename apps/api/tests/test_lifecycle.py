@@ -114,9 +114,11 @@ def test_port_retrain_saves_clean_darts_artifact(monkeypatch, tmp_path):
     pytest.importorskip("torch")
     from taime_api.training.port_tsmixer import retrain_port_model
 
+    fake_series = [0.0] * 40  # longer than input + output chunk (24 + 12)
+
     class FakePortModel:
         def fit(self, *, series, past_covariates):
-            assert series == ["series"]
+            assert series == [fake_series]
             assert past_covariates == ["covariates"]
 
         def save(self, path, clean=False):
@@ -125,18 +127,21 @@ def test_port_retrain_saves_clean_darts_artifact(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         "taime_api.training.port_tsmixer.load_port_timeseries",
-        lambda dataset_dir, max_series: (["series"], ["covariates"]),
+        lambda dataset_dir, max_series: ([fake_series], ["covariates"]),
     )
     monkeypatch.setattr(
-        "taime_api.training.port_tsmixer._resolve_structural_params",
-        lambda dataset_dir, config, forecast_horizon: {
-            "input_chunk_length": 24,
-            "output_chunk_length": 12,
-            "hidden_size": 16,
-            "ff_size": 32,
-            "num_blocks": 1,
-            "activation": "ReLU",
-        },
+        "taime_api.training.port_tsmixer._resolve_seed_recipe",
+        lambda dataset_dir, config, forecast_horizon: (
+            {
+                "input_chunk_length": 24,
+                "output_chunk_length": 12,
+                "hidden_size": 16,
+                "ff_size": 32,
+                "num_blocks": 1,
+                "activation": "ReLU",
+            },
+            {"architecture_source": "seed"},
+        ),
     )
     monkeypatch.setattr(
         "taime_api.training.port_tsmixer.build_tsmixer_model",

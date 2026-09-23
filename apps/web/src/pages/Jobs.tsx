@@ -55,7 +55,7 @@ export function Jobs() {
     const [dropout, setDropout] = useState(0.2);
     const [normType, setNormType] = useState('LayerNorm');
     const [normalizeBefore, setNormalizeBefore] = useState(false);
-    const [useReversibleInstanceNorm, setUseReversibleInstanceNorm] = useState(true);
+    const [useReversibleInstanceNorm, setUseReversibleInstanceNorm] = useState(false);
     const [lrSchedulerFactor, setLrSchedulerFactor] = useState(0.5);
     const [lrSchedulerPatience, setLrSchedulerPatience] = useState(5);
     const [weightDecay, setWeightDecay] = useState(0.1);
@@ -159,7 +159,7 @@ export function Jobs() {
             setDropout(0.2);
             setNormType('LayerNorm');
             setNormalizeBefore(false);
-            setUseReversibleInstanceNorm(true);
+            setUseReversibleInstanceNorm(false);
             setLrSchedulerFactor(0.5);
             setLrSchedulerPatience(5);
             setSampleMode('full');
@@ -248,6 +248,11 @@ export function Jobs() {
                 config.use_reversible_instance_norm = useReversibleInstanceNorm;
                 config.lr_scheduler_factor = Number(lrSchedulerFactor);
                 config.lr_scheduler_patience = Math.trunc(Number(lrSchedulerPatience));
+                // Blank = train on every series in the package (the backend default).
+                const maxSeries = Math.trunc(Number(maxSamples));
+                if (maxSamples && maxSeries > 0) {
+                    config.max_series = maxSeries;
+                }
             }
 
             if (sutType === 'disinfo_fake' || sutType === 'disinfo_hate') {
@@ -515,6 +520,18 @@ export function Jobs() {
                                             onChange={(event) =>
                                                 setLrSchedulerPatience(Number(event.target.value))
                                             }
+                                        />
+                                    </div>
+                                    <div className="form-group">
+                                        <label htmlFor="max-series">Max series (port calls)</label>
+                                        <input
+                                            type="number"
+                                            id="max-series"
+                                            value={maxSamples}
+                                            min={1}
+                                            step={1}
+                                            onChange={(event) => setMaxSamples(event.target.value)}
+                                            placeholder="All series"
                                         />
                                     </div>
                                     <label className="toggle-row" htmlFor="rev-in">

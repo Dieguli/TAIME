@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
+import pickle
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,7 +45,8 @@ class PortTrainingConfig:
     forecast_horizon: int = 48
     stride: int = 1
     last_points_only: bool = False
-    max_series: int | None = 20
+    max_series: int | None = None
+    backtest_max_series: int | None = 20
     run_backtest: bool = True
     accelerator: str = "cpu"
     metrics_mode: str = "classification"
@@ -91,16 +95,16 @@ def parse_port_config(config: dict[str, Any] | None) -> PortTrainingConfig:
         except (TypeError, ValueError):
             return None
 
-    max_series = config.get("max_series")
-    if max_series is None:
-        max_series_value: int | None = 20
-    else:
+    def _to_cap(value: Any, default: int | None) -> int | None:
+        # Series-count caps: None or <= 0 -> no cap (all series); invalid -> default.
+        # services.jobs stores None for "all", so an explicit None must stay None.
+        if value is None:
+            return None
         try:
-            max_series_value = int(max_series)
-        except (TypeError, ValueError):
-            max_series_value = 20
-        if max_series_value <= 0:
-            max_series_value = None
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return None if parsed <= 0 else parsed
 
     metrics_mode = str(config.get("metrics_mode") or "classification").lower()
     threshold = _to_float(config.get("classification_threshold"))
@@ -110,7 +114,8 @@ def parse_port_config(config: dict[str, Any] | None) -> PortTrainingConfig:
         forecast_horizon=max(1, _to_int(config.get("forecast_horizon"), 48)),
         stride=max(1, _to_int(config.get("stride"), 1)),
         last_points_only=_to_bool(config.get("last_points_only"), False),
-        max_series=max_series_value,
+        max_series=_to_cap(config.get("max_series"), None),
+        backtest_max_series=_to_cap(config.get("backtest_max_series", 20), 20),
         run_backtest=_to_bool(config.get("backtest"), True),
         accelerator=str(config.get("accelerator") or "cpu"),
         metrics_mode=metrics_mode,
@@ -430,6 +435,7 @@ def write_training_report(
             "stride": config.stride,
             "last_points_only": config.last_points_only,
             "max_series": config.max_series,
+            "backtest_max_series": config.backtest_max_series,
             "run_backtest": config.run_backtest,
             "accelerator": config.accelerator,
             "metrics_mode": config.metrics_mode,
@@ -457,7 +463,9 @@ def run_port_evaluation(
                 raise TrainingCancelled()
     if progress:
         progress(5.0, "Loading dataset")
-    series, past_covariates = load_port_timeseries(dataset_dir, port_config.max_series)
+    # Evaluation is a backtest only, so it is bounded like the retrain backtest.
+    eval_limit = port_config.max_series or port_config.backtest_max_series
+    series, past_covariates = load_port_timeseries(dataset_dir, eval_limit)
 
     if progress:
         progress(35.0, "Resolving model paths")
@@ -544,31 +552,106 @@ def extract_structural_params(model: Any) -> dict[str, Any]:
     return recovered
 
 
-def _resolve_structural_params(
+class _UnresolvedSeedClass:
+    """Inert stand-in for a class pickled into a seed model but missing here."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __setstate__(self, state: Any) -> None:
+        self.__dict__["_pickled_state"] = state
+
+
+def read_seed_model(model_path: Path) -> tuple[Any, list[str]]:
+    """Unpickle a seed ``TSMixerModel`` wrapper, tolerating classes this process lacks.
+
+    Partner seeds can reference helpers defined in their training script's
+    ``__main__`` (e.g. a custom torchmetrics metric), which makes
+    ``TSMixerModel.load`` fail with "Can't get attribute ... on <module '__main__'>".
+    Retraining only reuses the stored constructor params, so unresolvable classes
+    become inert placeholders and are returned for reporting. Like
+    ``TSMixerModel.load``, this unpickles the seed, i.e. trusts the uploaded package.
+    """
+    unresolved: list[str] = []
+    placeholders: dict[str, type] = {}
+
+    class _TolerantUnpickler(pickle.Unpickler):
+        def find_class(self, module: str, name: str) -> Any:
+            try:
+                return super().find_class(module, name)
+            except (AttributeError, ImportError):
+                qualified = f"{module}.{name}"
+                if qualified not in placeholders:
+                    unresolved.append(qualified)
+                    placeholders[qualified] = type(name, (_UnresolvedSeedClass,), {})
+                return placeholders[qualified]
+
+    pickle_module = types.ModuleType("taime_tolerant_pickle")
+    pickle_module.Unpickler = _TolerantUnpickler  # type: ignore[attr-defined]
+    pickle_module.load = lambda f, **kw: _TolerantUnpickler(f, **kw).load()  # type: ignore[attr-defined]
+    with open(model_path, "rb") as fh:
+        model = torch.load(fh, map_location="cpu", weights_only=False, pickle_module=pickle_module)
+    return model, unresolved
+
+
+def seed_loss_info(seed_loss: Any) -> dict[str, Any]:
+    """Describe the seed's loss for the job report; the retrain does not reuse it.
+
+    The retrain always trains logits with a plain ``BCEWithLogitsLoss`` (see
+    :func:`build_tsmixer_model`). A seed ``pos_weight`` is only reported: Darts
+    0.39 cannot reload a ``clean=True`` artifact whose loss carries buffers (the
+    rebuilt ``train_criterion``/``val_criterion`` lack them, so the strict
+    state_dict load fails), and up-weighting the majority positive class pushes
+    predictions further toward 1.
+    """
+    info: dict[str, Any] = {
+        "seed_loss_fn": type(seed_loss).__name__ if seed_loss is not None else None
+    }
+    pos_weight = getattr(seed_loss, "pos_weight", None)
+    if isinstance(pos_weight, torch.Tensor) and pos_weight.numel() == 1:
+        info["seed_pos_weight"] = float(pos_weight.item())
+    return info
+
+
+def _resolve_seed_recipe(
     dataset_dir: Path,
     config: dict[str, Any],
     forecast_horizon: int,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Resolve TSMixer architecture, preferring the seed model, then config, then defaults.
 
-    Logs loudly which path was taken so a silent always-fallback (which would
-    quietly change ``hidden_size``/``ff_size``/``num_blocks``) is visible.
+    Returns ``(structural, provenance)``. Which path was taken is logged loudly
+    *and* recorded in ``provenance`` (merged into the job metrics), so a fallback
+    that changes the architecture is visible in the report, not only in the
+    container log.
     """
     structural = dict(PORT_STRUCTURAL_DEFAULTS)
     structural["output_chunk_length"] = forecast_horizon
+    provenance: dict[str, Any] = {"architecture_source": "defaults"}
 
     try:
         paths = resolve_model_paths(dataset_dir, config)
-        seed_model = load_tsmixer_model(paths.model_path, accelerator="cpu")
+        seed_model, unresolved = read_seed_model(paths.model_path)
+        if unresolved:
+            logger.warning(
+                "Port retrain: seed model references classes unavailable here %s; "
+                "ignored (only the seed's constructor params are reused)",
+                unresolved,
+            )
+            provenance["seed_unresolved_classes"] = unresolved
         recovered = extract_structural_params(seed_model)
         if recovered:
             logger.info("Port retrain: recovered architecture from seed model: %s", recovered)
             structural.update(recovered)
+            provenance["architecture_source"] = "seed"
         else:
             logger.warning(
                 "Port retrain: could not read architecture from seed model; using defaults %s",
                 structural,
             )
+        seed_params = getattr(seed_model, "model_params", None)
+        if isinstance(seed_params, dict):
+            provenance.update(seed_loss_info(seed_params.get("loss_fn")))
     except Exception as exc:  # noqa: BLE001 - seed model is optional for from-scratch retrain
         logger.warning(
             "Port retrain: no usable seed model (%s); using default architecture %s",
@@ -580,7 +663,31 @@ def _resolve_structural_params(
     if overrides:
         logger.info("Port retrain: applying explicit structural overrides: %s", overrides)
         structural.update(overrides)
-    return structural
+    return structural, provenance
+
+
+def _split_backtest_holdout(
+    pairs: list[tuple[TimeSeries, TimeSeries]],
+    config: PortTrainingConfig,
+    backtest: bool,
+) -> tuple[list[tuple[TimeSeries, TimeSeries]], list[tuple[TimeSeries, TimeSeries]]]:
+    """Hold out a few whole series (port calls) for the post-training backtest.
+
+    Backtesting the training series only yields in-sample metrics, and a
+    stride-1 backtest over every series of a full-size package is prohibitively
+    slow. So a seeded sample of at most ``backtest_max_series`` series (and at
+    most ~10%) is excluded from the fit and backtested instead. With fewer than
+    two series nothing is held out and the backtest stays in-sample.
+    """
+    if not backtest or len(pairs) < 2:
+        return pairs, []
+    cap = config.backtest_max_series or len(pairs)
+    n_holdout = max(1, min(cap, len(pairs) // 10))
+    rng = np.random.default_rng(42)
+    held = {int(i) for i in rng.choice(len(pairs), size=n_holdout, replace=False)}
+    train = [pair for i, pair in enumerate(pairs) if i not in held]
+    holdout = [pair for i, pair in enumerate(pairs) if i in held]
+    return train, holdout
 
 
 def _make_port_progress_callback(
@@ -637,7 +744,14 @@ def build_tsmixer_model(
     accelerator: str,
     extra_callbacks: list[Any] | None = None,
 ) -> TSMixerModel:
-    """Construct a fresh TSMixerModel from structural + tunable hyperparameters."""
+    """Construct a fresh TSMixerModel from structural + tunable hyperparameters.
+
+    The port target is a binary state per time step and the model output is read
+    as a logit (TAIME's backtest, and the partner's assessment, threshold
+    ``sigmoid(output) >= 0.5``), so the model trains with ``BCEWithLogitsLoss``
+    like the partner's seed. Darts' default ``MSELoss`` trains a regressor whose
+    outputs sit around [0, 1], where ``sigmoid >= 0.5`` everywhere: only 1s.
+    """
     from darts.models import TSMixerModel
 
     pl_trainer_kwargs: dict[str, Any] = {
@@ -659,6 +773,8 @@ def build_tsmixer_model(
         norm_type=str(hparams["norm_type"]),
         normalize_before=bool(hparams["normalize_before"]),
         use_reversible_instance_norm=bool(hparams["use_reversible_instance_norm"]),
+        # No pos_weight: loss buffers break Darts' reload of the clean artifact.
+        loss_fn=torch.nn.BCEWithLogitsLoss(),
         batch_size=int(hparams["batch_size"]),
         n_epochs=int(hparams["n_epochs"]),
         optimizer_kwargs={"lr": float(hparams["learning_rate"])},
@@ -686,13 +802,15 @@ def retrain_port_model(
     Honors the partner-approved tunable hyperparameters (batch size, dropout,
     learning rate, LR scheduler factor/patience, reversible-instance-norm,
     normalize_before, norm_type) while preserving the original architecture
-    sizes when they can be recovered from the bundled seed model.
+    sizes when they can be recovered from the seed model. Trains on every series
+    in the package unless ``max_series`` caps it.
     """
     config = config or {}
     port_config = parse_port_config(config)
     device = resolve_device(config)
     accelerator = darts_accelerator(device)
     hparams = resolve_port_hparams(config)
+    backtest = port_config.run_backtest and port_config.metrics_mode == "classification"
 
     if _is_port_job_cancelled(job_id):
         raise TrainingCancelled()
@@ -702,7 +820,28 @@ def retrain_port_model(
 
     if progress:
         progress(25.0, "Resolving architecture")
-    structural = _resolve_structural_params(dataset_dir, config, port_config.forecast_horizon)
+    structural, provenance = _resolve_seed_recipe(dataset_dir, config, port_config.forecast_horizon)
+
+    # Darts aborts the whole fit on a series shorter than one training window, so
+    # skip those port calls (and report how many) instead of failing the job.
+    min_length = int(structural["input_chunk_length"]) + int(structural["output_chunk_length"])
+    pairs = [(s, c) for s, c in zip(series, past_covariates, strict=True) if len(s) >= min_length]
+    skipped = len(series) - len(pairs)
+    if skipped:
+        logger.warning(
+            "Port retrain: skipped %d of %d series shorter than %d time steps",
+            skipped,
+            len(series),
+            min_length,
+        )
+    if not pairs:
+        raise PortDatasetError(
+            f"No series is long enough to train on (need at least {min_length} time steps)"
+        )
+    train_pairs, holdout_pairs = _split_backtest_holdout(pairs, port_config, backtest)
+    train_series = [s for s, _ in train_pairs]
+    train_covariates = [c for _, c in train_pairs]
+    eval_pairs = holdout_pairs or train_pairs[: port_config.backtest_max_series]
 
     if _is_port_job_cancelled(job_id):
         raise TrainingCancelled()
@@ -720,7 +859,7 @@ def retrain_port_model(
 
     if progress:
         progress(55.0, "Training")
-    model.fit(series=series, past_covariates=past_covariates)
+    model.fit(series=train_series, past_covariates=train_covariates)
 
     if _is_port_job_cancelled(job_id):
         raise TrainingCancelled()
@@ -731,20 +870,39 @@ def retrain_port_model(
     model.save(str(model_path), clean=True)
 
     metrics: dict[str, Any] = {}
-    if port_config.run_backtest and port_config.metrics_mode == "classification":
+    if backtest:
         if progress:
             progress(92.0, "Running backtest")
         try:
-            metrics.update(run_backtest(model, series, past_covariates, port_config))
+            # The metrics only score each window's last point, so ask Darts for just
+            # those: same numbers, far less memory, and no frequency inference on
+            # held-out series that yield only one or two windows.
+            metrics.update(
+                run_backtest(
+                    model,
+                    [s for s, _ in eval_pairs],
+                    [c for _, c in eval_pairs],
+                    dataclasses.replace(port_config, last_points_only=True),
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - backtest is best-effort, never fail the retrain
             logger.warning("Port retrain backtest failed: %s", exc)
             metrics["backtest_error"] = str(exc)
+        metrics["backtest_series"] = len(eval_pairs)
+        metrics["metrics_scope"] = "held_out_series" if holdout_pairs else "in_sample"
 
     metrics.update(
         {
-            "series_used": len(series),
+            "series_used": len(train_series),
+            "series_skipped_too_short": skipped,
             "forecast_horizon": port_config.forecast_horizon,
-            "hyperparameters": {**hparams, "device": device, **structural},
+            **provenance,
+            "hyperparameters": {
+                **hparams,
+                "device": device,
+                **structural,
+                "loss_fn": "BCEWithLogitsLoss",
+            },
         }
     )
 
