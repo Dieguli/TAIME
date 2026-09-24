@@ -49,8 +49,6 @@ RUN pip install --upgrade pip \
 # main.py resolves STATIC_DIR to /app/apps/api/static.
 COPY apps/api/ /app/apps/api/
 COPY scripts/ /app/scripts/
-# pyproject.toml references ../../README.md for its long description.
-COPY README.md /app/README.md
 RUN pip install -e /app/apps/api
 
 # Built SPA from the web stage.

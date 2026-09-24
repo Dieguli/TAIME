@@ -51,8 +51,6 @@ RUN pip install --upgrade pip \
 # Backend source + editable install (keeps src layout so static resolves).
 COPY apps/api/ /app/apps/api/
 COPY scripts/ /app/scripts/
-# pyproject.toml references ../../README.md for its long description.
-COPY README.md /app/README.md
 RUN pip install -e /app/apps/api
 
 COPY --from=web-build /app/apps/api/static /app/apps/api/static
