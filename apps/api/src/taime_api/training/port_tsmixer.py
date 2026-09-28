@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
 import os
 import pickle
+import sys
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,6 +49,8 @@ class PortTrainingConfig:
     last_points_only: bool = False
     max_series: int | None = None
     backtest_max_series: int | None = 20
+    warm_start: bool = True
+    max_samples_per_ts: int | None = None
     run_backtest: bool = True
     accelerator: str = "cpu"
     metrics_mode: str = "classification"
@@ -116,6 +120,8 @@ def parse_port_config(config: dict[str, Any] | None) -> PortTrainingConfig:
         last_points_only=_to_bool(config.get("last_points_only"), False),
         max_series=_to_cap(config.get("max_series"), None),
         backtest_max_series=_to_cap(config.get("backtest_max_series", 20), 20),
+        warm_start=_to_bool(config.get("warm_start"), True),
+        max_samples_per_ts=_to_cap(config.get("max_samples_per_ts"), None),
         run_backtest=_to_bool(config.get("backtest"), True),
         accelerator=str(config.get("accelerator") or "cpu"),
         metrics_mode=metrics_mode,
@@ -184,15 +190,84 @@ def load_port_timeseries(
     return series, past_covariates
 
 
+LEGACY_SEED_CLASS_NAMES = ("PrimerSecuenciaUnosDistance",)
+
+
+@contextlib.contextmanager
+def legacy_seed_classes() -> Iterator[None]:
+    """Temporarily expose the partner's training-script classes on ``__main__``.
+
+    The partner's seeds were pickled from their training script, so a custom
+    metric such as ``PrimerSecuenciaUnosDistance`` is recorded as
+    ``__main__.<name>``, both in the ``.pt`` and in the ``.ckpt``'s saved metrics.
+    ``TSMixerModel.load`` can only unpickle them if ``__main__`` has those names,
+    so add the missing ones for the duration of the load and remove them after.
+    """
+    from taime_api.training import legacy_metrics
+
+    main = sys.modules["__main__"]
+    added = []
+    for name in LEGACY_SEED_CLASS_NAMES:
+        if not hasattr(main, name):
+            setattr(main, name, getattr(legacy_metrics, name))
+            added.append(name)
+    try:
+        yield
+    finally:
+        for name in added:
+            with contextlib.suppress(AttributeError):
+                delattr(main, name)
+
+
+_LOSS_STATE_PREFIXES = ("criterion", "train_criterion", "val_criterion")
+
+
+def _unloaded_network_keys(loaded: dict[str, Any], saved: dict[str, Any]) -> list[str]:
+    """Network tensors (loss buffers excluded) that did not come from ``saved``.
+
+    Covers both directions: saved tensors missing from or different in the model,
+    and model tensors the checkpoint lacks (those would stay randomly initialised).
+    """
+
+    def _network(key: str) -> bool:
+        return not key.startswith(_LOSS_STATE_PREFIXES)
+
+    differs = [
+        key
+        for key, value in saved.items()
+        if _network(key)
+        and (key not in loaded or not torch.equal(loaded[key].cpu(), value.to(loaded[key].dtype)))
+    ]
+    absent = [key for key in loaded if _network(key) and key not in saved]
+    return differs + absent
+
+
 def load_tsmixer_model(model_path: Path, accelerator: str = "cpu") -> TSMixerModel:
-    """Load the TSMixer model with safe defaults."""
+    """Load the TSMixer model with safe defaults.
+
+    Darts 0.39 cannot reload its own save when the loss carries buffers (e.g.
+    ``BCEWithLogitsLoss(pos_weight=...)``): it rebuilds ``train_criterion`` and
+    ``val_criterion`` without them and the strict state-dict load fails. On that
+    error only, reload leniently and prove every network tensor still loaded.
+    """
     from darts.models import TSMixerModel
 
     accelerator = accelerator or "cpu"
-    kwargs = {"pl_trainer_kwargs": {"accelerator": accelerator}}
+    kwargs: dict[str, Any] = {"pl_trainer_kwargs": {"accelerator": accelerator}}
     if accelerator == "cpu":
         kwargs["map_location"] = "cpu"
-    return TSMixerModel.load(path=str(model_path), **kwargs)
+    with legacy_seed_classes():
+        try:
+            return TSMixerModel.load(path=str(model_path), **kwargs)
+        except RuntimeError as exc:
+            if "criterion" not in str(exc):
+                raise
+            model = TSMixerModel.load(path=str(model_path), strict=False, **kwargs)
+            ckpt = torch.load(str(model_path) + ".ckpt", map_location="cpu", weights_only=False)
+            not_loaded = _unloaded_network_keys(model.model.state_dict(), ckpt["state_dict"])
+            if not_loaded:
+                raise PortDatasetError(f"Model weights did not load: {not_loaded[:5]}") from exc
+            return model
 
 
 def run_backtest(
@@ -219,6 +294,125 @@ def run_backtest(
     )
     metrics["classification_threshold"] = config.classification_threshold
     return metrics
+
+
+def horizon_window_metrics(
+    logits: np.ndarray,
+    actual: np.ndarray,
+    last_observed: np.ndarray,
+    *,
+    threshold: float,
+    horizon: int,
+    longitud_secuencia: int = 1,
+    first_ones_threshold: float | None = None,
+) -> dict[str, float]:
+    """Score full forecast windows, incl. the partner's first-ones distance.
+
+    ``logits``/``actual`` are ``(windows, horizon)``; ``last_observed`` is the
+    target value just before each window. Besides accuracy and per-class F1 over
+    every step, it reports the partner's ``PrimerSecuenciaUnosDistance`` for the
+    model and, on the same windows, for two baselines that make it readable:
+    persistence (repeat the last observed state) and a model predicting all 1s.
+    ``first_ones_threshold`` (the seed's own metric setting, if any) applies to the
+    partner metric only; the classification scores use ``threshold``.
+    """
+    from taime_api.training.legacy_metrics import PrimerSecuenciaUnosDistance
+
+    distance_threshold = threshold if first_ones_threshold is None else first_ones_threshold
+
+    actual_ones = np.asarray(actual) >= 0.5
+    predicted_ones = _sigmoid(np.asarray(logits, dtype=np.float64)) >= threshold
+    target = torch.as_tensor(actual_ones.astype(np.int64))
+
+    def _distance(values: np.ndarray, from_logits: bool) -> float:
+        metric = PrimerSecuenciaUnosDistance(
+            longitud_secuencia=longitud_secuencia,
+            horizon=horizon,
+            from_logits=from_logits,
+            threshold=distance_threshold,
+        )
+        metric.update(torch.as_tensor(values, dtype=torch.float32), target)
+        return float(metric.compute())
+
+    tp = int(np.sum(predicted_ones & actual_ones))
+    tn = int(np.sum(~predicted_ones & ~actual_ones))
+    fp = int(np.sum(predicted_ones & ~actual_ones))
+    fn = int(np.sum(~predicted_ones & actual_ones))
+    persistence = np.repeat((np.asarray(last_observed) >= 0.5)[:, None], horizon, axis=1)
+    return {
+        "horizon_windows": int(actual_ones.shape[0]),
+        "horizon_accuracy": (tp + tn) / actual_ones.size,
+        "horizon_f1": 2 * tp / (2 * tp + fp + fn) if tp + fp + fn else 0.0,
+        "horizon_f1_negative": 2 * tn / (2 * tn + fn + fp) if tn + fn + fp else 0.0,
+        "horizon_predicted_positive_rate": float(predicted_ones.mean()),
+        "horizon_actual_positive_rate": float(actual_ones.mean()),
+        "first_ones_distance": _distance(np.asarray(logits), from_logits=True),
+        "first_ones_distance_persistence": _distance(persistence, from_logits=False),
+        "first_ones_distance_all_ones": _distance(np.ones_like(persistence), from_logits=False),
+        "first_ones_sequence_length": longitud_secuencia,
+        "first_ones_threshold": distance_threshold,
+    }
+
+
+def run_horizon_backtest(
+    model: TSMixerModel,
+    series: list[TimeSeries],
+    past_covariates: list[TimeSeries],
+    config: PortTrainingConfig,
+    first_ones_params: dict[str, Any] | None = None,
+    start_position: int | None = None,
+) -> dict[str, float]:
+    """Backtest full ``forecast_horizon`` windows and score them (see horizon_window_metrics).
+
+    The last-point backtest only looks 48 steps ahead, where nearly every window
+    is 1, so it cannot tell a working model from one that predicts only 1s.
+    ``start_position`` fixes the first forecast origin so two models with
+    different input lengths are scored on the same windows; series too short for
+    it are left out.
+    """
+    horizon = config.forecast_horizon
+    kwargs: dict[str, Any] = {}
+    if start_position is not None:
+        keep = [i for i, ts in enumerate(series) if len(ts) >= start_position + horizon]
+        series = [series[i] for i in keep]
+        past_covariates = [past_covariates[i] for i in keep]
+        kwargs = {"start": start_position, "start_format": "position"}
+        if not series:
+            raise PortDatasetError("No series is long enough for the common forecast start")
+    forecasts = model.historical_forecasts(
+        series=series,
+        past_covariates=past_covariates,
+        forecast_horizon=horizon,
+        stride=config.stride,
+        retrain=False,
+        last_points_only=False,
+        verbose=False,
+        **kwargs,
+    )
+    logits_rows, actual_rows, last_rows = [], [], []
+    for actual_ts, windows in zip(series, forecasts, strict=False):
+        if not isinstance(windows, list):
+            windows = [windows]
+        actual_values = actual_ts.values(copy=False)[:, 0]
+        index = actual_ts.time_index
+        for window in windows:
+            start = index.get_loc(window.start_time())
+            if window.n_timesteps != horizon or start < 1 or start + horizon > len(index):
+                continue
+            logits_rows.append(window.values(copy=False)[:, 0])
+            actual_rows.append(actual_values[start : start + horizon])
+            last_rows.append(actual_values[start - 1])
+    if not logits_rows:
+        raise PortDatasetError("No full forecast windows to evaluate")
+    return horizon_window_metrics(
+        np.stack(logits_rows),
+        np.stack(actual_rows),
+        np.asarray(last_rows),
+        threshold=config.classification_threshold,
+        horizon=horizon,
+        longitud_secuencia=int((first_ones_params or {}).get("longitud_secuencia", 1)),
+        first_ones_threshold=(first_ones_params or {}).get("threshold"),
+    )
 
 
 def _compute_classification_metrics(
@@ -436,6 +630,8 @@ def write_training_report(
             "last_points_only": config.last_points_only,
             "max_series": config.max_series,
             "backtest_max_series": config.backtest_max_series,
+            "warm_start": config.warm_start,
+            "max_samples_per_ts": config.max_samples_per_ts,
             "run_backtest": config.run_backtest,
             "accelerator": config.accelerator,
             "metrics_mode": config.metrics_mode,
@@ -475,11 +671,39 @@ def run_port_evaluation(
         progress(45.0, "Loading model")
     model = load_tsmixer_model(model_paths.model_path, accelerator=port_config.accelerator)
 
+    # A series without one full forecast window makes historical_forecasts fail.
+    min_length = int(getattr(model, "input_chunk_length", 0) or 0) + port_config.forecast_horizon
+    kept = [(s, c) for s, c in zip(series, past_covariates, strict=True) if len(s) >= min_length]
+    if not kept:
+        raise PortDatasetError(
+            f"No series is long enough to evaluate (need at least {min_length} time steps)"
+        )
+    series = [s for s, _ in kept]
+    past_covariates = [c for _, c in kept]
+
     metrics: dict[str, Any] = {}
     if port_config.run_backtest and port_config.metrics_mode == "classification":
         if progress:
             progress(70.0, "Running backtest")
-        metrics.update(run_backtest(model, series, past_covariates, port_config))
+        try:
+            metrics.update(run_backtest(model, series, past_covariates, port_config))
+        except Exception as exc:  # noqa: BLE001 - keep the full-horizon metrics below
+            logger.warning("Port evaluation backtest failed: %s", exc)
+            metrics["backtest_error"] = str(exc)
+        try:
+            seed_params = getattr(model, "model_params", None) or {}
+            metrics.update(
+                run_horizon_backtest(
+                    model,
+                    series,
+                    past_covariates,
+                    port_config,
+                    first_ones_params=seed_first_ones_params(seed_params.get("torch_metrics")),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - extra metrics must not fail the evaluation
+            logger.warning("Port evaluation horizon backtest failed: %s", exc)
+            metrics["horizon_metrics_error"] = str(exc)
     elif port_config.metrics_mode == "pending":
         metrics.update(
             {
@@ -613,12 +837,54 @@ def seed_loss_info(seed_loss: Any) -> dict[str, Any]:
     return info
 
 
+def _iter_metrics(obj: Any) -> Iterator[Any]:
+    """Yield leaf metric objects from a seed's ``torch_metrics`` (collection, dict or list)."""
+    if isinstance(obj, dict):
+        children: Any = obj.values()
+    elif isinstance(obj, (list, tuple)):
+        children = obj
+    else:
+        modules = getattr(obj, "_modules", None)
+        if not isinstance(modules, dict) or not modules:
+            if obj is not None:
+                yield obj
+            return
+        children = modules.values()
+    for child in children:
+        yield from _iter_metrics(child)
+
+
+def seed_first_ones_params(torch_metrics: Any) -> dict[str, Any] | None:
+    """Read the partner's ``PrimerSecuenciaUnosDistance`` settings from a seed, if present.
+
+    The retrain reads seeds with placeholders for unknown classes, so the metric
+    may be a placeholder whose attributes sit in its pickled state.
+    """
+    for metric in _iter_metrics(torch_metrics):
+        if type(metric).__name__ != "PrimerSecuenciaUnosDistance":
+            continue
+        state = vars(metric).get("_pickled_state", vars(metric))
+        if not isinstance(state, dict):
+            return None
+        params = {}
+        if isinstance(state.get("longitud_secuencia"), int):
+            params["longitud_secuencia"] = state["longitud_secuencia"]
+        if isinstance(state.get("threshold"), (int, float)):
+            params["threshold"] = float(state["threshold"])
+        return params or None
+    return None
+
+
 def _resolve_seed_recipe(
     dataset_dir: Path,
     config: dict[str, Any],
     forecast_horizon: int,
+    apply_overrides: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Resolve TSMixer architecture, preferring the seed model, then config, then defaults.
+
+    ``apply_overrides=False`` (warm start) ignores structural overrides from the
+    config, since the seed's weights only fit the seed's own architecture.
 
     Returns ``(structural, provenance)``. Which path was taken is logged loudly
     *and* recorded in ``provenance`` (merged into the job metrics), so a fallback
@@ -652,6 +918,9 @@ def _resolve_seed_recipe(
         seed_params = getattr(seed_model, "model_params", None)
         if isinstance(seed_params, dict):
             provenance.update(seed_loss_info(seed_params.get("loss_fn")))
+            first_ones = seed_first_ones_params(seed_params.get("torch_metrics"))
+            if first_ones:
+                provenance["seed_first_ones_params"] = first_ones
     except Exception as exc:  # noqa: BLE001 - seed model is optional for from-scratch retrain
         logger.warning(
             "Port retrain: no usable seed model (%s); using default architecture %s",
@@ -660,7 +929,10 @@ def _resolve_seed_recipe(
         )
 
     overrides = structural_overrides_from_config(config)
-    if overrides:
+    if overrides and not apply_overrides:
+        logger.info("Port retrain: warm start ignores structural overrides %s", overrides)
+        provenance["ignored_structural_overrides"] = overrides
+    elif overrides:
         logger.info("Port retrain: applying explicit structural overrides: %s", overrides)
         structural.update(overrides)
     return structural, provenance
@@ -790,6 +1062,105 @@ def build_tsmixer_model(
     )
 
 
+_SEED_SCORE_KEYS = (
+    "first_ones_distance",
+    "horizon_accuracy",
+    "horizon_f1",
+    "horizon_f1_negative",
+    "horizon_predicted_positive_rate",
+)
+# Settings that change the network's parameters, so a warm start must take them
+# from the seed (the form's values would not match the seed's weights).
+_SEED_STRUCTURE_KEYS = ("use_reversible_instance_norm", "norm_type", "normalize_before")
+
+
+def seed_shape_mismatch(
+    train_sample_shape: Any,
+    *,
+    target_width: int,
+    covariate_width: int | None,
+    static_size: int,
+    input_chunk_length: int,
+    output_chunk_length: int,
+) -> str | None:
+    """Why the seed's weights cannot be reused for this data, or ``None`` if they can.
+
+    ``train_sample_shape`` is what Darts stores in the seed ``.ckpt``:
+    ``[past target, past covariates, historic future, future, static, future target]``.
+    """
+    try:
+        past_target, past_cov, _, _, static, future_target = train_sample_shape
+        seed_icl, seed_target_width = past_target
+        seed_ocl = future_target[0]
+    except (TypeError, ValueError):
+        return "seed checkpoint does not record its input shapes"
+    seed_cov_width = past_cov[1] if past_cov else None
+    seed_static_size = int(np.prod(static)) if static else 0
+    checks = [
+        ("target width", seed_target_width, target_width),
+        ("past covariate width", seed_cov_width, covariate_width),
+        ("static covariate size", seed_static_size, static_size),
+        ("input_chunk_length", seed_icl, input_chunk_length),
+        ("output_chunk_length", seed_ocl, output_chunk_length),
+    ]
+    for name, seed_value, data_value in checks:
+        if seed_value != data_value:
+            return f"seed {name} {seed_value} != {data_value} for this retrain"
+    return None
+
+
+def warm_start_from_seed(
+    seed_path: Path,
+    structural: dict[str, Any],
+    hparams: dict[str, Any],
+    accelerator: str,
+    extra_callbacks: list[Any] | None,
+    series: list[TimeSeries],
+    past_covariates: list[TimeSeries],
+) -> tuple[TSMixerModel | None, dict[str, Any]]:
+    """Build the model with the seed's structure and load the seed's weights into it.
+
+    Returns ``(model, info)``. ``model`` is ``None`` when the seed cannot be
+    reused (``info["warm_start_fallback_reason"]`` says why), so the caller
+    trains from scratch instead of from partly random weights. The retrain keeps
+    its own plain ``BCEWithLogitsLoss``: loss buffers such as the seed's
+    ``pos_weight`` are not loaded (they would also break the artifact's reload).
+    """
+    ckpt_path = Path(str(seed_path) + ".ckpt")
+    if not ckpt_path.exists():
+        return None, {
+            "warm_start_fallback_reason": f"seed weights {ckpt_path.name} (.ckpt) not found"
+        }
+    with legacy_seed_classes():
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    static = series[0].static_covariates
+    reason = seed_shape_mismatch(
+        ckpt.get("train_sample_shape"),
+        target_width=series[0].width,
+        covariate_width=past_covariates[0].width if past_covariates[0] is not None else None,
+        static_size=int(static.size) if static is not None else 0,
+        input_chunk_length=int(structural["input_chunk_length"]),
+        output_chunk_length=int(structural["output_chunk_length"]),
+    )
+    if reason:
+        return None, {"warm_start_fallback_reason": reason}
+
+    seed_hparams = ckpt.get("hyper_parameters") or {}
+    structure = {k: seed_hparams[k] for k in _SEED_STRUCTURE_KEYS if k in seed_hparams}
+    model = build_tsmixer_model(structural, {**hparams, **structure}, accelerator, extra_callbacks)
+    with legacy_seed_classes():
+        # strict=False only skips the seed's loss buffers; every network tensor is
+        # verified below, so a partial load can never go unnoticed.
+        model.load_weights(
+            str(seed_path), load_encoders=False, skip_checks=True, map_location="cpu", strict=False
+        )
+    not_loaded = _unloaded_network_keys(model.model.state_dict(), ckpt["state_dict"])
+    if not_loaded:
+        return None, {"warm_start_fallback_reason": f"seed weights did not load: {not_loaded[:5]}"}
+    return model, {"init_weights": "seed", "warm_start_structure": structure}
+
+
 def retrain_port_model(
     dataset_dir: Path,
     config: dict[str, Any] | None,
@@ -797,8 +1168,11 @@ def retrain_port_model(
     job_id: int,
     progress: Callable[[float, str], None] | None = None,
 ) -> PortTrainingResult:
-    """Retrain the port TSMixer model from scratch on the uploaded dataset.
+    """Retrain the port TSMixer model on the uploaded dataset.
 
+    By default it fine-tunes from the seed's weights (``warm_start``); from
+    scratch, the approved ranges did not produce a model better than persistence.
+    Falls back to scratch, recording why, when the package has no compatible seed.
     Honors the partner-approved tunable hyperparameters (batch size, dropout,
     learning rate, LR scheduler factor/patience, reversible-instance-norm,
     normalize_before, norm_type) while preserving the original architecture
@@ -820,7 +1194,50 @@ def retrain_port_model(
 
     if progress:
         progress(25.0, "Resolving architecture")
-    structural, provenance = _resolve_seed_recipe(dataset_dir, config, port_config.forecast_horizon)
+    structural, provenance = _resolve_seed_recipe(
+        dataset_dir,
+        config,
+        port_config.forecast_horizon,
+        apply_overrides=not port_config.warm_start,
+    )
+
+    # Per-epoch progress + cancellation during the long fit (defensive: None if
+    # Lightning is unavailable, in which case fit proceeds exactly as before).
+    progress_cb = _make_port_progress_callback(job_id, int(hparams["n_epochs"]))
+    callbacks = [progress_cb] if progress_cb is not None else None
+    model: TSMixerModel | None = None
+    init_info: dict[str, Any] = {"init_weights": "scratch"}
+    if port_config.warm_start:
+        # Decided before the length filter: a fall back to scratch restores the
+        # user's structural overrides, which can change the minimum series length.
+        if provenance.get("architecture_source") != "seed":
+            init_info["warm_start_fallback_reason"] = "no readable seed model to start from"
+        else:
+            try:
+                seed_path = resolve_model_paths(dataset_dir, config).model_path
+                model, info = warm_start_from_seed(
+                    seed_path,
+                    structural,
+                    hparams,
+                    accelerator,
+                    callbacks,
+                    series,
+                    past_covariates,
+                )
+                init_info.update(info)
+            except Exception as exc:  # noqa: BLE001 - fall back to scratch, reported below
+                model = None
+                init_info["warm_start_fallback_reason"] = f"seed weights could not be loaded: {exc}"
+        if model is None:
+            init_info["init_weights"] = "scratch"
+            logger.warning(
+                "Port retrain: warm start not possible (%s); training from scratch",
+                init_info.get("warm_start_fallback_reason"),
+            )
+            ignored = provenance.pop("ignored_structural_overrides", None)
+            if ignored:
+                logger.info("Port retrain: applying structural overrides %s after all", ignored)
+                structural.update(ignored)
 
     # Darts aborts the whole fit on a series shorter than one training window, so
     # skip those port calls (and report how many) instead of failing the job.
@@ -847,19 +1264,18 @@ def retrain_port_model(
         raise TrainingCancelled()
     if progress:
         progress(40.0, "Building model")
-    # Per-epoch progress + cancellation during the long fit (defensive: None if
-    # Lightning is unavailable, in which case fit proceeds exactly as before).
-    progress_cb = _make_port_progress_callback(job_id, int(hparams["n_epochs"]))
-    model = build_tsmixer_model(
-        structural,
-        hparams,
-        accelerator,
-        extra_callbacks=[progress_cb] if progress_cb is not None else None,
-    )
+    if model is None:
+        model = build_tsmixer_model(structural, hparams, accelerator, extra_callbacks=callbacks)
+    effective_hparams = {**hparams, **init_info.get("warm_start_structure", {})}
 
     if progress:
         progress(55.0, "Training")
-    model.fit(series=train_series, past_covariates=train_covariates)
+    fit_kwargs = (
+        {"max_samples_per_ts": port_config.max_samples_per_ts}
+        if port_config.max_samples_per_ts
+        else {}
+    )
+    model.fit(series=train_series, past_covariates=train_covariates, **fit_kwargs)
 
     if _is_port_job_cancelled(job_id):
         raise TrainingCancelled()
@@ -873,6 +1289,8 @@ def retrain_port_model(
     if backtest:
         if progress:
             progress(92.0, "Running backtest")
+        eval_series = [s for s, _ in eval_pairs]
+        eval_covariates = [c for _, c in eval_pairs]
         try:
             # The metrics only score each window's last point, so ask Darts for just
             # those: same numbers, far less memory, and no frequency inference on
@@ -880,16 +1298,67 @@ def retrain_port_model(
             metrics.update(
                 run_backtest(
                     model,
-                    [s for s, _ in eval_pairs],
-                    [c for _, c in eval_pairs],
+                    eval_series,
+                    eval_covariates,
                     dataclasses.replace(port_config, last_points_only=True),
                 )
             )
         except Exception as exc:  # noqa: BLE001 - backtest is best-effort, never fail the retrain
             logger.warning("Port retrain backtest failed: %s", exc)
             metrics["backtest_error"] = str(exc)
+        # Score the seed on the very same windows ("did retraining beat the seed?").
+        # Both models start forecasting at the same origin even if their input
+        # lengths differ, otherwise they would be scored on different windows.
+        seed_model = None
+        if provenance.get("architecture_source") == "seed":
+            try:
+                seed_path = resolve_model_paths(dataset_dir, config).model_path
+                seed_model = load_tsmixer_model(seed_path, accelerator=accelerator)
+            except Exception as exc:  # noqa: BLE001 - best-effort comparison
+                logger.warning("Port retrain: could not load the seed to score it: %s", exc)
+                metrics["seed_metrics_error"] = str(exc)
+        model_icl = int(structural["input_chunk_length"])
+        seed_icl = getattr(seed_model, "input_chunk_length", None)
+        start_position = (
+            max(model_icl, int(seed_icl)) if seed_icl and int(seed_icl) != model_icl else None
+        )
+        first_ones_params = provenance.get("seed_first_ones_params")
+        try:
+            metrics.update(
+                run_horizon_backtest(
+                    model,
+                    eval_series,
+                    eval_covariates,
+                    port_config,
+                    first_ones_params=first_ones_params,
+                    start_position=start_position,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort, like the backtest above
+            logger.warning("Port retrain horizon backtest failed: %s", exc)
+            metrics["horizon_metrics_error"] = str(exc)
+        if seed_model is not None:
+            try:
+                seed_metrics = run_horizon_backtest(
+                    seed_model,
+                    eval_series,
+                    eval_covariates,
+                    port_config,
+                    first_ones_params=first_ones_params,
+                    start_position=start_position,
+                )
+                metrics.update({f"seed_{k}": seed_metrics[k] for k in _SEED_SCORE_KEYS})
+            except Exception as exc:  # noqa: BLE001 - best-effort comparison
+                logger.warning("Port retrain: could not score the seed: %s", exc)
+                metrics["seed_metrics_error"] = str(exc)
         metrics["backtest_series"] = len(eval_pairs)
         metrics["metrics_scope"] = "held_out_series" if holdout_pairs else "in_sample"
+        if provenance.get("architecture_source") == "seed":
+            metrics["holdout_note"] = (
+                "Held out from this retrain only. The seed may have been trained on these "
+                "port calls, so the seed_* scores (and a warm-started model's) can be "
+                "optimistic; judge them on port calls the seed never saw."
+            )
 
     metrics.update(
         {
@@ -897,11 +1366,14 @@ def retrain_port_model(
             "series_skipped_too_short": skipped,
             "forecast_horizon": port_config.forecast_horizon,
             **provenance,
+            **init_info,
             "hyperparameters": {
-                **hparams,
+                **effective_hparams,
                 "device": device,
                 **structural,
                 "loss_fn": "BCEWithLogitsLoss",
+                "warm_start": port_config.warm_start,
+                "max_samples_per_ts": port_config.max_samples_per_ts,
             },
         }
     )

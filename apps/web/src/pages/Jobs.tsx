@@ -56,6 +56,8 @@ export function Jobs() {
     const [normType, setNormType] = useState('LayerNorm');
     const [normalizeBefore, setNormalizeBefore] = useState(false);
     const [useReversibleInstanceNorm, setUseReversibleInstanceNorm] = useState(false);
+    const [warmStart, setWarmStart] = useState(true);
+    const [maxSamplesPerTs, setMaxSamplesPerTs] = useState('');
     const [lrSchedulerFactor, setLrSchedulerFactor] = useState(0.5);
     const [lrSchedulerPatience, setLrSchedulerPatience] = useState(5);
     const [weightDecay, setWeightDecay] = useState(0.1);
@@ -160,6 +162,8 @@ export function Jobs() {
             setNormType('LayerNorm');
             setNormalizeBefore(false);
             setUseReversibleInstanceNorm(false);
+            setWarmStart(true);
+            setMaxSamplesPerTs('');
             setLrSchedulerFactor(0.5);
             setLrSchedulerPatience(5);
             setSampleMode('full');
@@ -252,6 +256,12 @@ export function Jobs() {
                 const maxSeries = Math.trunc(Number(maxSamples));
                 if (maxSamples && maxSeries > 0) {
                     config.max_series = maxSeries;
+                }
+                // Fine-tune from the seed's weights (its RIN/norm settings then apply).
+                config.warm_start = warmStart;
+                const samplesPerTs = Math.trunc(Number(maxSamplesPerTs));
+                if (maxSamplesPerTs && samplesPerTs > 0) {
+                    config.max_samples_per_ts = samplesPerTs;
                 }
             }
 
@@ -487,6 +497,7 @@ export function Jobs() {
                                         <select
                                             id="norm-type"
                                             value={normType}
+                                            disabled={warmStart}
                                             onChange={(event) => setNormType(event.target.value)}
                                         >
                                             <option value="LayerNorm">LayerNorm</option>
@@ -534,11 +545,33 @@ export function Jobs() {
                                             placeholder="All series"
                                         />
                                     </div>
+                                    <div className="form-group">
+                                        <label htmlFor="max-samples-per-ts">Max samples per series</label>
+                                        <input
+                                            type="number"
+                                            id="max-samples-per-ts"
+                                            value={maxSamplesPerTs}
+                                            min={1}
+                                            step={1}
+                                            onChange={(event) => setMaxSamplesPerTs(event.target.value)}
+                                            placeholder="Darts default"
+                                        />
+                                    </div>
+                                    <label className="toggle-row" htmlFor="warm-start">
+                                        <input
+                                            type="checkbox"
+                                            id="warm-start"
+                                            checked={warmStart}
+                                            onChange={(event) => setWarmStart(event.target.checked)}
+                                        />
+                                        Start from seed weights (uses the seed's norm settings)
+                                    </label>
                                     <label className="toggle-row" htmlFor="rev-in">
                                         <input
                                             type="checkbox"
                                             id="rev-in"
                                             checked={useReversibleInstanceNorm}
+                                            disabled={warmStart}
                                             onChange={(event) =>
                                                 setUseReversibleInstanceNorm(event.target.checked)
                                             }
@@ -550,6 +583,7 @@ export function Jobs() {
                                             type="checkbox"
                                             id="norm-before"
                                             checked={normalizeBefore}
+                                            disabled={warmStart}
                                             onChange={(event) => setNormalizeBefore(event.target.checked)}
                                         />
                                         Normalize before

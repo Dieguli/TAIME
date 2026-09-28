@@ -147,6 +147,14 @@ export const latestModelBySut = (models: Model[]) => latestBySut(models);
 export const metricHighlights = (metrics?: Record<string, unknown> | null) => {
     if (!metrics) return [];
     const preferred = [
+        // Port: the partner's first-ones distance for the retrained model, the seed
+        // (same held-out windows) and persistence, then full-horizon accuracy; the
+        // last-point `accuracy` alone cannot tell a working model from all ones.
+        'first_ones_distance',
+        'seed_first_ones_distance',
+        'first_ones_distance_persistence',
+        'horizon_accuracy',
+        'horizon_f1',
         'accuracy',
         'f1_macro',
         'f1',

@@ -21,6 +21,7 @@ from taime_api.training.config_validation import ConfigValidationError, validate
         },
         {"batch_size": 64, "norm_type": "LayerNorm", "device": "cuda"},
         {"max_series": 500, "backtest_max_series": 0},  # <= 0 means "all series"
+        {"warm_start": True, "max_samples_per_ts": 300},
     ],
 )
 def test_port_valid(config):
@@ -39,6 +40,8 @@ def test_port_valid(config):
         {"norm_type": "Nope"},  # not an allowed norm
         {"max_series": "all"},  # series caps must be integers
         {"backtest_max_series": 2.5},
+        {"warm_start": "maybe"},  # must be a boolean
+        {"max_samples_per_ts": "all"},  # must be an integer
     ],
 )
 def test_port_invalid(config):

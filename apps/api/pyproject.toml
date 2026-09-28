@@ -56,6 +56,8 @@ packages = ["src/taime_api"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+# Partner-authored metric kept verbatim (see the file header).
+extend-exclude = ["src/taime_api/training/legacy_metrics.py"]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 

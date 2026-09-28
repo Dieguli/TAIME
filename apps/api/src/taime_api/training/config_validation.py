@@ -124,8 +124,9 @@ def _validate_port(config: dict[str, Any], errors: list[str]) -> None:
     _check_bool(config, "normalize_before", errors)
     _check_min_int(config, "epochs", 1, errors)
     _check_min_int(config, "n_epochs", 1, errors)
-    # Series-count caps: any integer; <= 0 means "all series".
-    for key in ("max_series", "backtest_max_series"):
+    _check_bool(config, "warm_start", errors)
+    # Series / sample caps: any integer; <= 0 means "no cap".
+    for key in ("max_series", "backtest_max_series", "max_samples_per_ts"):
         if not _present(config, key):
             continue
         value = config[key]
@@ -134,7 +135,7 @@ def _validate_port(config: dict[str, Any], errors: list[str]) -> None:
         except (TypeError, ValueError, OverflowError):
             valid = False
         if not valid:
-            errors.append(f"{key} must be an integer (<= 0 means all series)")
+            errors.append(f"{key} must be an integer (<= 0 means no cap)")
 
 
 def _validate_common_training(config: dict[str, Any], errors: list[str]) -> None:

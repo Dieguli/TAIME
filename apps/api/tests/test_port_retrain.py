@@ -23,6 +23,11 @@ def test_normalize_port_config_trains_on_all_series_by_default():
     assert _normalize_port_config({"max_series": 0})["max_series"] is None
     assert _normalize_port_config({"max_series": 50})["max_series"] == 50
     assert _normalize_port_config({})["backtest_max_series"] == 20
+    assert _normalize_port_config({})["warm_start"] is True  # default: fine-tune the seed
+    assert _normalize_port_config({"warm_start": False})["warm_start"] is False
+    assert _normalize_port_config({})["max_samples_per_ts"] is None
+    assert _normalize_port_config({"max_samples_per_ts": 0})["max_samples_per_ts"] is None
+    assert _normalize_port_config({"max_samples_per_ts": 300})["max_samples_per_ts"] == 300
 
 
 def test_parse_port_config_keeps_all_series():
@@ -217,7 +222,7 @@ def test_retrain_filters_short_series_and_backtests_held_out(monkeypatch, tmp_pa
     monkeypatch.setattr(
         port_tsmixer,
         "_resolve_seed_recipe",
-        lambda d, c, h: (
+        lambda d, c, h, apply_overrides=True: (
             dict(PORT_STRUCTURAL_DEFAULTS),
             {"architecture_source": "seed", "seed_pos_weight": 2.3},
         ),

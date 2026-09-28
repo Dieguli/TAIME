@@ -131,7 +131,7 @@ def test_port_retrain_saves_clean_darts_artifact(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         "taime_api.training.port_tsmixer._resolve_seed_recipe",
-        lambda dataset_dir, config, forecast_horizon: (
+        lambda dataset_dir, config, forecast_horizon, apply_overrides=True: (
             {
                 "input_chunk_length": 24,
                 "output_chunk_length": 12,

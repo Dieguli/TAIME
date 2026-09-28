@@ -82,6 +82,12 @@ def _normalize_port_config(config: dict[str, Any]) -> dict[str, Any]:
     # The post-training backtest runs on a few held-out series (<= 0 means "all").
     backtest_max_series = _to_int(config.get("backtest_max_series"), 20)
     normalized["backtest_max_series"] = None if backtest_max_series <= 0 else backtest_max_series
+    # Default: fine-tune from the seed's weights (falls back to scratch, with the
+    # reason in the report, when the package has no compatible seed).
+    normalized["warm_start"] = _to_bool(config.get("warm_start"), True)
+    # Optional cap on training windows per series (<= 0 / missing = Darts default).
+    max_samples_per_ts = _to_int(config.get("max_samples_per_ts"), 0)
+    normalized["max_samples_per_ts"] = None if max_samples_per_ts <= 0 else max_samples_per_ts
     normalized["backtest"] = _to_bool(config.get("backtest"), True)
     normalized["accelerator"] = config.get("accelerator") or _device_to_accelerator(
         config.get("device")
