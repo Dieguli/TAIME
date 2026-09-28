@@ -19,6 +19,7 @@ import {
     SutType,
     formatBytes,
     formatDate,
+    formatKey,
     formatMetric,
     formatPercent,
     latestDatasetBySut,
@@ -29,6 +30,13 @@ import {
 } from '../lib/demo';
 
 import './Dashboard.css';
+
+// The headline metric differs per SUT (port: the partner's first-ones distance,
+// lower is better; others: accuracy), so it is always shown with its name.
+const headlineMetric = (metrics?: Record<string, unknown> | null) => {
+    const headline = metricHighlights(metrics)[0];
+    return headline ? `${formatKey(headline.key)}: ${formatMetric(headline.value)}` : 'N/A';
+};
 
 export function Dashboard() {
     const [datasets, setDatasets] = useState<Dataset[]>([]);
@@ -195,7 +203,7 @@ export function Dashboard() {
                                     </span>
                                 </div>
                                 <span className="compact-row-value">
-                                    {formatMetric(metricHighlights(model.metrics)[0]?.value)}
+                                    {headlineMetric(model.metrics)}
                                 </span>
                             </div>
                         ))}
