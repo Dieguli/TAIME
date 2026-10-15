@@ -91,7 +91,13 @@ DEFAULT_HATE_SPEECH_ZIP = Path(
         "models_datasets/FakeNews_HateSpeech_model.zip",
     )
 )
-DEFAULT_ASSETS_DIR = Path(os.getenv("HATE_SPEECH_ASSETS_DIR", "data/hf/hate_speech"))
+# The base model is extracted into the dataset's own folder, so a run always uses the
+# bundle that dataset was uploaded with, and the copy is deleted along with the dataset.
+ASSETS_DIRNAME = ".hf_assets"
+WEIGHTS_FOLDERS = {
+    "binary": "ROBERTA_hate_speech",
+    "multilabel": "ROBERTA_hate_speech_multilabel",
+}
 
 
 class TextDataset(Dataset):
@@ -123,10 +129,23 @@ def _find_file(dataset_path: Path, name: str) -> Path | None:
     return None
 
 
+def _asset_layout(assets_dir: Path) -> dict[str, Path]:
+    return {name: assets_dir / name for name in ("tokenizer", "binary", "multilabel")}
+
+
 def _ensure_assets(dataset_path: Path) -> dict[str, Path]:
-    tokenizer_dir = DEFAULT_ASSETS_DIR / "tokenizer"
-    binary_dir = DEFAULT_ASSETS_DIR / "binary"
-    multilabel_dir = DEFAULT_ASSETS_DIR / "multilabel"
+    dataset_dir = dataset_path if dataset_path.is_dir() else dataset_path.parent
+    assets_dir = dataset_dir / ASSETS_DIRNAME
+    if assets_dir.is_dir():
+        # Hydrated by an earlier run on this same dataset; uploads never change.
+        return _asset_layout(assets_dir)
+
+    # Extract into a private staging dir and publish it with a single rename, so a
+    # crashed or concurrent run never leaves a half-written bundle behind.
+    staging_dir = Path(tempfile.mkdtemp(prefix=f"{ASSETS_DIRNAME}-", dir=dataset_dir))
+    tokenizer_dir = staging_dir / "tokenizer"
+    binary_dir = staging_dir / "binary"
+    multilabel_dir = staging_dir / "multilabel"
 
     def _extract_assets_from_archive(archive: zipfile.ZipFile) -> bool:
         extracted = False
@@ -219,56 +238,59 @@ def _ensure_assets(dataset_path: Path) -> dict[str, Path]:
                 + ". Include tokenizer files in the model zip."
             )
 
-    if tokenizer_dir.exists() and binary_dir.exists() and multilabel_dir.exists():
-        _ensure_tokenizer_config()
-        try:
-            _ensure_tokenizer_files()
-        except FileNotFoundError:
-            logger.warning(
-                "Hate speech assets are incomplete. Attempting to rehydrate from model zip."
+    try:
+        tokenizer_dir.mkdir()
+        binary_dir.mkdir()
+        multilabel_dir.mkdir()
+
+        zip_candidates: list[Path] = []
+        if dataset_path.exists():
+            if dataset_path.is_file() and dataset_path.suffix.lower() == ".zip":
+                zip_candidates.append(dataset_path)
+            elif dataset_path.is_dir():
+                zip_candidates.extend(sorted(dataset_path.rglob("*.zip")))
+
+        if DEFAULT_HATE_SPEECH_ZIP.exists():
+            zip_candidates.append(DEFAULT_HATE_SPEECH_ZIP)
+
+        archive_path = None
+        for candidate in zip_candidates:
+            if not candidate.exists():
+                continue
+            if _extract_assets_from_zip(candidate):
+                archive_path = candidate
+                break
+
+        if archive_path is None:
+            raise FileNotFoundError(
+                "Hate speech model zip not found. Provide it in the dataset package or set "
+                "HATE_SPEECH_MODEL_ZIP."
             )
-        else:
-            return {
-                "tokenizer": tokenizer_dir,
-                "binary": binary_dir,
-                "multilabel": multilabel_dir,
-            }
 
-    tokenizer_dir.mkdir(parents=True, exist_ok=True)
-    binary_dir.mkdir(parents=True, exist_ok=True)
-    multilabel_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_tokenizer_config()
+        _ensure_tokenizer_files()
+        try:
+            staging_dir.rename(assets_dir)
+        except OSError:
+            if not assets_dir.is_dir():
+                raise
+            # A concurrent run on the same dataset published first; use its copy.
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    return _asset_layout(assets_dir)
 
-    zip_candidates: list[Path] = []
-    if dataset_path.exists():
-        if dataset_path.is_file() and dataset_path.suffix.lower() == ".zip":
-            zip_candidates.append(dataset_path)
-        elif dataset_path.is_dir():
-            zip_candidates.extend(sorted(dataset_path.rglob("*.zip")))
 
-    if DEFAULT_HATE_SPEECH_ZIP.exists():
-        zip_candidates.append(DEFAULT_HATE_SPEECH_ZIP)
-
-    archive_path = None
-    for candidate in zip_candidates:
-        if not candidate.exists():
-            continue
-        if _extract_assets_from_zip(candidate):
-            archive_path = candidate
-            break
-
-    if archive_path is None:
-        raise FileNotFoundError(
-            "Hate speech model zip not found. Provide it in the dataset package or set "
-            "HATE_SPEECH_MODEL_ZIP."
-        )
-
-    _ensure_tokenizer_config()
-    _ensure_tokenizer_files()
-    return {
-        "tokenizer": tokenizer_dir,
-        "binary": binary_dir,
-        "multilabel": multilabel_dir,
-    }
+def _require_weights(model_dir: Path, classification_type: str) -> None:
+    """Fail with the expected zip layout instead of transformers' 'Unrecognized model'."""
+    has_weights = any(model_dir.glob("*.safetensors")) or any(model_dir.glob("*.bin"))
+    if (model_dir / "config.json").is_file() and has_weights:
+        return
+    raise FileNotFoundError(
+        f"No {classification_type} model weights found in this dataset's model bundle. "
+        "Put config.json and model.safetensors under "
+        f"<your folder>/models/{WEIGHTS_FOLDERS[classification_type]}/ in the dataset zip "
+        "(zip the folder itself, not the files inside it), then upload it as a new dataset."
+    )
 
 
 def _map_target_to_label(target: str) -> str:
@@ -382,8 +404,9 @@ def train_hate_speech_model(
     set_seed(hparams["seed"])
 
     assets = _ensure_assets(dataset_path)
+    model_dir = assets[classification_type]
+    _require_weights(model_dir, classification_type)
     tokenizer = AutoTokenizer.from_pretrained(assets["tokenizer"], local_files_only=True)
-    model_dir = assets["binary"] if classification_type == "binary" else assets["multilabel"]
     num_labels = 2 if classification_type == "binary" else 5
     model = AutoModelForSequenceClassification.from_pretrained(
         model_dir,
